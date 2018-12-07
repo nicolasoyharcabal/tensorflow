@@ -2043,10 +2043,11 @@ class PhasedLSTMCell(rnn_cell_impl.RNNCell):
     return new_h, new_state
 
 
-class ConvLSTMCell(rnn_cell_impl.RNNCell):
+class ConvReccurrentCell(rnn_cell_impl.RNNCell):
   """Convolutional LSTM recurrent network cell.
-
   https://arxiv.org/pdf/1506.04214v1.pdf
+     JANET recurrent neural network
+  https://arxiv.org/abs/1804.04849
   """
 
   def __init__(self,
@@ -2054,30 +2055,29 @@ class ConvLSTMCell(rnn_cell_impl.RNNCell):
                input_shape,
                output_channels,
                kernel_shape,
+               kind,
+               t_max = None,
                use_bias=True,
                skip_connection=False,
-               forget_bias=1.0,
-               initializers=None,
-               name="conv_lstm_cell"):
-    """Construct ConvLSTMCell.
-
+               name="conv_rnn_cell"):
+    """Construct ConvRNNCell.
     Args:
       conv_ndims: Convolution dimensionality (1, 2 or 3).
       input_shape: Shape of the input as int tuple, excluding the batch size.
       output_channels: int, number of output channels of the conv LSTM.
       kernel_shape: Shape of kernel as in tuple (of size 1,2 or 3).
+      kind: Kind of ConvRNN like ConvJANET or ConvLSTM.
+      t_max: Maximun time in the time series for Chrono initializer.
       use_bias: (bool) Use bias in convolutions.
       skip_connection: If set to `True`, concatenate the input to the
         output of the conv LSTM. Default: `False`.
-      forget_bias: Forget bias.
       initializers: Unused.
       name: Name of the module.
-
     Raises:
       ValueError: If `skip_connection` is `True` and stride is different from 1
         or if `input_shape` is incompatible with `conv_ndims`.
     """
-    super(ConvLSTMCell, self).__init__(name=name)
+    super(ConvReccurrentCell, self).__init__(name=name)
 
     if conv_ndims != len(input_shape) - 1:
       raise ValueError("Invalid input_shape {} for conv_ndims={}.".format(
@@ -2087,8 +2087,9 @@ class ConvLSTMCell(rnn_cell_impl.RNNCell):
     self._input_shape = input_shape
     self._output_channels = output_channels
     self._kernel_shape = kernel_shape
+    self._t_max = t_max
+    self._kind = kind
     self._use_bias = use_bias
-    self._forget_bias = forget_bias
     self._skip_connection = skip_connection
 
     self._total_output_channels = output_channels
@@ -2111,15 +2112,28 @@ class ConvLSTMCell(rnn_cell_impl.RNNCell):
 
   def call(self, inputs, state, scope=None):
     cell, hidden = state
-    new_hidden = _conv([inputs, hidden], self._kernel_shape,
-                       4 * self._output_channels, self._use_bias)
-    gates = array_ops.split(
-        value=new_hidden, num_or_size_splits=4, axis=self._conv_ndims + 1)
 
-    input_gate, new_input, forget_gate, output_gate = gates
-    new_cell = math_ops.sigmoid(forget_gate + self._forget_bias) * cell
-    new_cell += math_ops.sigmoid(input_gate) * math_ops.tanh(new_input)
-    output = math_ops.tanh(new_cell) * math_ops.sigmoid(output_gate)
+    if self._kind == "JANET":
+        new_hidden = _conv([inputs, hidden], self._kernel_shape,
+                           2 * self._output_channels, self._use_bias, self._t_max,self._kind)
+        gates = array_ops.split(
+            value=new_hidden, num_or_size_splits=2, axis=self._conv_ndims + 1)
+
+        new_input, forget_gate = gates
+        new_cell = math_ops.sigmoid(forget_gate) * cell + (1 - math_ops.sigmoid(
+            forget_gate)) * math_ops.tanh(new_input / 3)
+        output = new_cell
+
+    elif self._kind == "LSTM":
+        new_hidden = _conv([inputs, hidden], self._kernel_shape,
+                           4 * self._output_channels, self._use_bias, self._t_max,self._kind)
+        gates = array_ops.split(
+            value=new_hidden, num_or_size_splits=4, axis=self._conv_ndims + 1)
+
+        input_gate, new_input, forget_gate, output_gate = gates
+        new_cell = math_ops.sigmoid(forget_gate) * cell
+        new_cell += math_ops.sigmoid(input_gate) * math_ops.tanh(new_input/3)
+        output = math_ops.tanh(new_cell/3) * math_ops.sigmoid(output_gate)
 
     if self._skip_connection:
       output = array_ops.concat([output, inputs], axis=-1)
@@ -2127,53 +2141,17 @@ class ConvLSTMCell(rnn_cell_impl.RNNCell):
     return output, new_state
 
 
-class Conv1DLSTMCell(ConvLSTMCell):
-  """1D Convolutional LSTM recurrent network cell.
-
-  https://arxiv.org/pdf/1506.04214v1.pdf
-  """
-
-  def __init__(self, name="conv_1d_lstm_cell", **kwargs):
-    """Construct Conv1DLSTM. See `ConvLSTMCell` for more details."""
-    super(Conv1DLSTMCell, self).__init__(conv_ndims=1, name=name, **kwargs)
 
 
-class Conv2DLSTMCell(ConvLSTMCell):
-  """2D Convolutional LSTM recurrent network cell.
-
-  https://arxiv.org/pdf/1506.04214v1.pdf
-  """
-
-  def __init__(self, name="conv_2d_lstm_cell", **kwargs):
-    """Construct Conv2DLSTM. See `ConvLSTMCell` for more details."""
-    super(Conv2DLSTMCell, self).__init__(conv_ndims=2, name=name, **kwargs)
-
-
-class Conv3DLSTMCell(ConvLSTMCell):
-  """3D Convolutional LSTM recurrent network cell.
-
-  https://arxiv.org/pdf/1506.04214v1.pdf
-  """
-
-  def __init__(self, name="conv_3d_lstm_cell", **kwargs):
-    """Construct Conv3DLSTM. See `ConvLSTMCell` for more details."""
-    super(Conv3DLSTMCell, self).__init__(conv_ndims=3, name=name, **kwargs)
-
-
-def _conv(args, filter_size, num_features, bias, bias_start=0.0):
+def _conv(args, filter_size, num_features, bias,_t_max,kind):
   """Convolution.
-
   Args:
     args: a Tensor or a list of Tensors of dimension 3D, 4D or 5D,
     batch x n, Tensors.
     filter_size: int tuple of filter height and width.
     num_features: int, number of features.
     bias: Whether to use biases in the convolution layer.
-    bias_start: starting value to initialize the bias; 0 by default.
-
-  Returns:
     A 3D, 4D, or 5D Tensor with shape [batch ... num_features]
-
   Raises:
     ValueError: if some of the arguments has unspecified or wrong shape.
   """
@@ -2181,18 +2159,20 @@ def _conv(args, filter_size, num_features, bias, bias_start=0.0):
   # Calculate the total size of arguments on dimension 1.
   total_arg_size_depth = 0
   shapes = [a.get_shape().as_list() for a in args]
+
   shape_length = len(shapes[0])
+
   for shape in shapes:
     if len(shape) not in [3, 4, 5]:
       raise ValueError("Conv Linear expects 3D, 4D "
                        "or 5D arguments: %s" % str(shapes))
     if len(shape) != len(shapes[0]):
+      print("shape_length", shape_length, len(shape))
       raise ValueError("Conv Linear expects all args "
                        "to be of same Dimension: %s" % str(shapes))
     else:
       total_arg_size_depth += shape[-1]
   dtype = [a.dtype for a in args][0]
-
   # determine correct conv operation
   if shape_length == 3:
     conv_op = nn_ops.conv1d
@@ -2206,23 +2186,59 @@ def _conv(args, filter_size, num_features, bias, bias_start=0.0):
 
   # Now the computation.
   kernel = vs.get_variable(
-      "kernel", filter_size + [total_arg_size_depth, num_features], dtype=dtype)
+      "kernel", filter_size + [total_arg_size_depth, num_features], dtype=dtype,
+  initializer=tf.contrib.layers.xavier_initializer_conv2d())
+
+
   if len(args) == 1:
     res = conv_op(args[0], kernel, strides, padding="SAME")
   else:
+    array = array_ops.concat(axis=shape_length - 1, values=args)
     res = conv_op(
-        array_ops.concat(axis=shape_length - 1, values=args),
+        array,
         kernel,
         strides,
         padding="SAME")
   if not bias:
     return res
+
   bias_term = vs.get_variable(
       "biases", [num_features],
       dtype=dtype,
-      initializer=init_ops.constant_initializer(bias_start, dtype=dtype))
+      initializer=chrono_init(_t_max,kind))
   return res + bias_term
 
+"""
+  Chrono initializer 
+  https://openreview.net/pdf?id=SJcKhk-Ab
+"""
+
+
+def chrono_init(t_max, kind):
+    def _initializer(shape, dtype=tf.float32, partition_info=None):
+
+        if kind == "LSTM":
+            num_units = shape[0] // 4
+            uni_vals = tf.log(random_ops.random_uniform([num_units], minval=1.0,
+                                                        maxval=t_max, dtype=dtype,
+                                                        seed=42))
+            # i, j, o, f
+            bias_i = -uni_vals
+            j_o = tf.zeros(2*num_units)
+            bias_f = uni_vals
+            return tf.concat([bias_i, j_o, bias_f], 0)
+
+        elif kind == "JANET":
+            num_units = shape[0] // 2
+            uni_vals = tf.log(random_ops.random_uniform([num_units], minval=1.0,
+                                                        maxval=t_max, dtype=dtype,
+                                                        seed=42))
+            bias_j = tf.zeros(num_units)
+            bias_f = uni_vals
+
+            return tf.concat([bias_j, bias_f], 0)
+
+    return _initializer
 
 class GLSTMCell(rnn_cell_impl.RNNCell):
   """Group LSTM cell (G-LSTM).
